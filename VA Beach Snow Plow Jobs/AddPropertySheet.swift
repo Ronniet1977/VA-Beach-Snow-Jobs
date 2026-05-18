@@ -1,4 +1,6 @@
 import SwiftUI
+import Combine
+import CoreLocation
 
 struct AddPropertySheet: View {
     @EnvironmentObject var session: SupabaseSessionStore
@@ -106,7 +108,12 @@ struct AddPropertySheet: View {
                 }
                 
                 let coordinate = try await GeocoderService.coordinates(for: addressTrim)
-                
+
+                guard let coordinate else {
+                    session.lastError = "Could not find coordinates for this address."
+                    return
+                }
+
                 let body = NewPropertyBody(
                     map_number: mapTrim,
                     name: nameTrim,
@@ -114,8 +121,8 @@ struct AddPropertySheet: View {
                     notes: notesTrim,
                     active: isActive,
                     priority: priority,
-                    latitude: coordinate?.latitude,
-                    longitude: coordinate?.longitude
+                    latitude: coordinate.latitude,
+                    longitude: coordinate.longitude
                 )
                 
                 if let editingProperty {

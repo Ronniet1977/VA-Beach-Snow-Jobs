@@ -1,6 +1,7 @@
 import SwiftUI
 import UIKit
 import CoreLocation
+import Combine
 
 @main
 struct VABeachJobber: App {
