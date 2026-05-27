@@ -30,10 +30,10 @@ struct AdminMapView: View {
                             coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon)
                         ) {
                             VStack(spacing: 4) {
-                                Image(systemName: icon(for: row.status))
+                                Image(systemName: icon(for: row))
                                     .font(.headline)
                                     .padding(8)
-                                    .background(color(for: row.status))
+                                    .background(color(for: row))
                                     .foregroundStyle(.white)
                                     .clipShape(Circle())
                                 
@@ -111,6 +111,13 @@ struct AdminMapView: View {
         return .green
     }
     
+    private func isStale(_ row: DriverStatusRow) -> Bool {
+        guard let iso = row.last_seen else { return true }
+        let f = ISO8601DateFormatter()
+        guard let date = f.date(from: iso) else { return true }
+        return Date().timeIntervalSince(date) > 15 * 60
+    }
+    
     private func centerOnFirstDriver() {
         guard let first = driversWithLocation.first,
               let lat = first.current_lat,
@@ -124,24 +131,81 @@ struct AdminMapView: View {
         )
     }
     
-    private func icon(for status: String?) -> String {
-        switch status {
-        case "working": return "snowflake"
-        case "issue": return "exclamationmark.triangle.fill"
-        case "stopped": return "pause.fill"
-        case "idle": return "circle.fill"
-        default: return "questionmark"
+    private func icon(for row: DriverStatusRow) -> String {
+        
+        let status = (row.status ?? "").lowercased()
+        
+        if status == "working" {
+            return "snowplow.fill"
         }
+        
+        if status == "issue" {
+            return "exclamationmark.triangle.fill"
+        }
+        
+        if status == "stopped" {
+            return "pause.circle.fill"
+        }
+        
+        if status == "idle" {
+            return "moon.zzz.fill"
+        }
+        
+        // stale GPS check
+        if let lastSeen = row.last_seen {
+            let iso = ISO8601DateFormatter()
+            
+            if let date = iso.date(from: lastSeen) {
+                
+                let minutes =
+                Date().timeIntervalSince(date) / 60
+                
+                if minutes > 15 {
+                    return "wifi.slash"
+                }
+            }
+        }
+        
+        return "car.fill"
     }
     
-    private func color(for status: String?) -> Color {
-        switch status {
-        case "working": return .green
-        case "issue": return .red
-        case "stopped": return .orange
-        case "idle": return .gray
-        default: return .gray
+    private func color(for row: DriverStatusRow) -> Color {
+        
+        let status = (row.status ?? "").lowercased()
+        
+        if status == "working" {
+            return .green
         }
+        
+        if status == "issue" {
+            return .red
+        }
+        
+        if status == "stopped" {
+            return .orange
+        }
+        
+        if status == "idle" {
+            return .gray
+        }
+        
+        // stale GPS
+        if let lastSeen = row.last_seen {
+            
+            let iso = ISO8601DateFormatter()
+            
+            if let date = iso.date(from: lastSeen) {
+                
+                let minutes =
+                Date().timeIntervalSince(date) / 60
+                
+                if minutes > 15 {
+                    return .black
+                }
+            }
+        }
+        
+        return .blue
     }
 }
 
@@ -188,6 +252,8 @@ struct PropertyDetailSheet: View {
                             
                             Text(property.address)
                                 .foregroundStyle(.secondary)
+                            
+                            
                             
                             if property.latitude == nil || property.longitude == nil {
                                 
@@ -290,7 +356,8 @@ struct PropertyDetailSheet: View {
     }
     
     private func openInMaps() {
-        let query = "\(property.name), \(property.address)"
+        let query = property.address
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
         
         if let url = URL(string: "http://maps.apple.com/?q=\(encoded)") {

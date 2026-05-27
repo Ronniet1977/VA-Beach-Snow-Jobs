@@ -40,6 +40,7 @@ struct AdminAssignmentsView: View {
     
     @State private var selectedGroupId: UUID?
     @State private var closestCountText = "5"
+    @State private var suggestedRouteIds: [UUID] = []
     
     var body: some View {
         NavigationStack {
@@ -324,7 +325,7 @@ struct AdminAssignmentsView: View {
             let seedProperty = filteredProperties.first {
                 selectedPropertyIds.contains($0.id)
             }
-            ForEach(filteredProperties) { p in
+            ForEach(orderedPropertiesForDisplay) { p in
                 Button {
                     toggle(p.id)
                 } label: {
@@ -383,7 +384,15 @@ struct AdminAssignmentsView: View {
                         set: { id in
                             selectedStormId = id
                             session.setActiveStorm(id)
-                            Task { await reloadAll() }
+                            
+                            Task {
+                                if let id {
+                                    session.activeStorm = try? await session.fetchStormById(id)
+                                }
+                                
+                                await reloadAll()
+                                await session.refreshDashboard()
+                            }
                         }
                     )) {
                         Text("Select…").tag(UUID?.none)
@@ -447,6 +456,13 @@ struct AdminAssignmentsView: View {
                                         Text(p.address)
                                             .font(.caption)
                                             .foregroundStyle(.secondary)
+                                    }
+                                    
+                                    if suggestedRouteIds.contains(p.id),
+                                       let miles = distanceFromPreviousStop(for: p) {
+                                        Text("\(miles, specifier: "%.1f") mi from previous stop")
+                                            .font(.caption2.weight(.semibold))
+                                            .foregroundStyle(.blue)
                                     }
                                     
                                     Spacer()
@@ -601,6 +617,36 @@ struct AdminAssignmentsView: View {
         }
     }
     
+    private var orderedPropertiesForDisplay: [PropertyRow] {
+        
+        let selectedRoute = suggestedRouteIds.compactMap { id in
+            filteredProperties.first { $0.id == id }
+        }
+        
+        let remaining = filteredProperties.filter {
+            !suggestedRouteIds.contains($0.id)
+        }
+        
+        return selectedRoute + remaining.sorted {
+            $0.map_number < $1.map_number
+        }
+    }
+    
+    private func distanceFromPreviousStop(for property: PropertyRow) -> Double? {
+        guard let index = suggestedRouteIds.firstIndex(of: property.id),
+              index > 0 else {
+            return nil
+        }
+        
+        let previousId = suggestedRouteIds[index - 1]
+        
+        guard let previous = properties.first(where: { $0.id == previousId }) else {
+            return nil
+        }
+        
+        return propertyDistanceMiles(from: previous, to: property)
+    }
+    
     private func assignGroupTapped() async {
         guard let stormId = selectedStormId else { return }
         
@@ -683,30 +729,36 @@ struct AdminAssignmentsView: View {
     
     private func selectClosestPropertiesForGroup() {
         let count = Int(closestCountText) ?? 5
-        
         let candidates = groupAvailableProperties
         
         guard !candidates.isEmpty else { return }
         
-        // Use first manually selected property as the "seed"
         guard let seedId = selectedPropertyIds.first,
-              let seed = candidates.first(where: { $0.id == seedId }),
-              let seedLat = seed.latitude,
-              let seedLon = seed.longitude else {
-            print("Select one starting property first.")
+              let seed = candidates.first(where: { $0.id == seedId }) else {
+            errorText = "Tap one starting property first."
             return
         }
         
-        let seedLocation = CLLocation(latitude: seedLat, longitude: seedLon)
+        var remaining = candidates.filter { $0.id != seed.id }
+        var route: [PropertyRow] = [seed]
         
-        let closest = candidates
-            .sorted {
-                distance(from: seedLocation, to: $0) <
-                    distance(from: seedLocation, to: $1)
+        while route.count < count && !remaining.isEmpty {
+            guard let last = route.last else { break }
+            
+            guard let next = remaining.min(by: {
+                (propertyDistanceMiles(from: last, to: $0) ?? .greatestFiniteMagnitude)
+                <
+                    (propertyDistanceMiles(from: last, to: $1) ?? .greatestFiniteMagnitude)
+            }) else {
+                break
             }
-            .prefix(count)
+            
+            route.append(next)
+            remaining.removeAll { $0.id == next.id }
+        }
         
-        selectedPropertyIds = Set(closest.map { $0.id })
+        suggestedRouteIds = route.map { $0.id }
+        selectedPropertyIds = Set(suggestedRouteIds)
     }
     
     private func distance(
@@ -807,7 +859,7 @@ struct AdminAssignmentsView: View {
         defer { isLoading = false }
         
         do {
-            async let s = session.fetchOpenStorms()
+            async let s = session.fetchStorms()
             async let d = session.fetchDrivers()
             async let p = session.fetchAllProperties()
             

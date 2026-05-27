@@ -91,15 +91,68 @@ final class AppStore: ObservableObject {
     @Published var stormDate: Date = .now
     @Published var rates = RateConfig()
     
+    private let kActivePropertyId = "activePropertyId"
+    private let kActivePropertyName = "activePropertyName"
+    private let kActiveStartedAt = "activeStartedAt"
+    private let kActiveStoppedAt = "activeStoppedAt"
+    private let kActiveService = "activeService"
+    private let kActiveIsRunning = "activeIsRunning"
+    
+    init() {
+        restoreClockState()
+    }
+    
+    func saveClockState() {
+        UserDefaults.standard.set(activePropertyId?.uuidString, forKey: kActivePropertyId)
+        UserDefaults.standard.set(activePropertyName, forKey: kActivePropertyName)
+        UserDefaults.standard.set(activeStartedAt, forKey: kActiveStartedAt)
+        UserDefaults.standard.set(activeStoppedAt, forKey: kActiveStoppedAt)
+        UserDefaults.standard.set(activeService.rawValue, forKey: kActiveService)
+        UserDefaults.standard.set(activeIsRunning, forKey: kActiveIsRunning)
+    }
+    
+    func restoreClockState() {
+        if let idString = UserDefaults.standard.string(forKey: kActivePropertyId) {
+            activePropertyId = UUID(uuidString: idString)
+        }
+        
+        activePropertyName = UserDefaults.standard.string(forKey: kActivePropertyName) ?? ""
+        activeStartedAt = UserDefaults.standard.object(forKey: kActiveStartedAt) as? Date
+        activeStoppedAt = UserDefaults.standard.object(forKey: kActiveStoppedAt) as? Date
+        
+        if let raw = UserDefaults.standard.string(forKey: kActiveService),
+           let service = ServiceType(rawValue: raw) {
+            activeService = service
+        }
+        
+        activeIsRunning = UserDefaults.standard.bool(forKey: kActiveIsRunning)
+        
+        if activeIsRunning, let started = activeStartedAt {
+            activeSeconds = max(0, Int(Date().timeIntervalSince(started)))
+        }
+    }
+    
+    func clearClockState() {
+        UserDefaults.standard.removeObject(forKey: kActivePropertyId)
+        UserDefaults.standard.removeObject(forKey: kActivePropertyName)
+        UserDefaults.standard.removeObject(forKey: kActiveStartedAt)
+        UserDefaults.standard.removeObject(forKey: kActiveStoppedAt)
+        UserDefaults.standard.removeObject(forKey: kActiveService)
+        UserDefaults.standard.removeObject(forKey: kActiveIsRunning)
+    }
+    
     struct DriverTotals: Identifiable, Hashable {
         var id: String { driver }
         let driver: String
+        var openUpHours: Double
         var plowHours: Double
         var saltHours: Double
         var standbyHours: Double
         var completedJobs: Int
         
-        var totalHours: Double { plowHours + saltHours + standbyHours }
+        var totalHours: Double {
+            openUpHours + plowHours + saltHours + standbyHours
+        }
     }
     
     func totalsByDriver() -> [DriverTotals] {
@@ -110,12 +163,14 @@ final class AppStore: ObservableObject {
             
             var t = dict[name] ?? DriverTotals(
                 driver: name,
+                openUpHours: 0,
                 plowHours: 0,
                 saltHours: 0,
                 standbyHours: 0,
                 completedJobs: 0
             )
             
+            t.openUpHours += billableHours(log.openUpHours)
             t.plowHours += billableHours(log.plowHours)
             t.saltHours += billableHours(log.saltHours)
             t.standbyHours += billableHours(log.standbyHours)
@@ -136,6 +191,7 @@ final class AppStore: ObservableObject {
     
     func money(for totals: DriverTotals) -> Double {
         let hourly =
+        totals.openUpHours * rates.openUpPerHour +
         totals.plowHours * rates.plowPerHour +
         totals.saltHours * rates.saltPerHour +
         totals.standbyHours * rates.standbyPerHour
@@ -183,6 +239,7 @@ final class AppStore: ObservableObject {
 }
 
 struct RateConfig: Codable, Hashable {
+    var openUpPerHour: Double = 150
     var plowPerHour: Double = 150
     var saltPerHour: Double = 140
     var standbyPerHour: Double = 85
@@ -195,6 +252,7 @@ struct StormLog: Identifiable, Hashable {
     var date: Date
     var driver: String
     var mapNumber: String
+    var openUpHours: Double
     var plowHours: Double
     var saltHours: Double
     var standbyHours: Double
@@ -293,8 +351,12 @@ struct StatTile: View {
 
 struct DashboardView: View {
     @EnvironmentObject var session: SupabaseSessionStore
+    @EnvironmentObject var store: AppStore
+    
     @State private var showLogSheet = false
+    @State private var showStormSettings = false
     @State private var dashboardService: ServiceType = .openUp
+    
     
     private let columns: [GridItem] = [
         GridItem(.flexible()),
@@ -476,6 +538,13 @@ struct DashboardView: View {
         return location.distance(from: CLLocation(latitude: lat, longitude: lon))
     }
     
+    private func formatTime(_ totalSeconds: Int) -> String {
+        let h = totalSeconds / 3600
+        let m = (totalSeconds % 3600) / 60
+        let s = totalSeconds % 60
+        return String(format: "%02d:%02d:%02d", h, m, s)
+    }
+    
     private func openInMaps(name: String, address: String) {
         let query = "\(name), \(address)"
         let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
@@ -489,6 +558,57 @@ struct DashboardView: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 14) {
+                    if store.activeIsRunning || store.activeStartedAt != nil {
+                        
+                        Card {
+                            VStack(alignment: .leading, spacing: 12) {
+                                
+                                HStack {
+                                    Label("ACTIVE JOB", systemImage: "bolt.fill")
+                                        .font(.headline)
+                                        .foregroundStyle(.green)
+                                    
+                                    Spacer()
+                                    
+                                    StatusPill(
+                                        systemImage: store.activeIsRunning ? "play.fill" : "pause.fill",
+                                        text: store.activeIsRunning ? "Running" : "Stopped"
+                                    )
+                                }
+                                
+                                Text(store.activePropertyName)
+                                    .font(.title3.bold())
+                                
+                                Text(store.activeService.rawValue)
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                                
+                                Text(formatTime(store.activeSeconds))
+                                    .font(.system(size: 34, weight: .bold, design: .rounded))
+                                    .monospacedDigit()
+                                
+                                if let started = store.activeStartedAt {
+                                    Text("Started \(started.formatted(date: .omitted, time: .shortened))")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                
+                                NavigationLink {
+                                    LogJobSheet(
+                                        initialService: store.activeService,
+                                        initialProperty: session.assignedProperties.first {
+                                            $0.id == store.activePropertyId
+                                        }
+                                    )
+                                } label: {
+                                    Label("Open Active Job", systemImage: "arrow.right.circle.fill")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(.borderedProminent)
+                            }
+                        }
+                    }
+                    
                     if session.role == "driver" {
                         Card {
                             VStack(alignment: .leading, spacing: 12) {
@@ -593,6 +713,16 @@ struct DashboardView: View {
                 LocationManager.shared.requestPermission()
                 LocationManager.shared.start()
                 
+                if store.activeIsRunning {
+                    
+                    await session.updateMyDriverStatus(
+                        status: "working",
+                        activePropertyId: store.activePropertyId,
+                        activeService: store.activeService.rawValue,
+                        startedAt: store.activeStartedAt
+                    )
+                }
+                
                 await session.refreshDashboard()
                 await session.refreshAssignedProperties()
             }
@@ -606,6 +736,10 @@ struct DashboardView: View {
                     initialService: dashboardService,
                     initialProperty: nextProperty
                 )
+            }
+            .sheet(isPresented: $showStormSettings) {
+                StormSettingsSheet()
+                    .environmentObject(session)
             }
             .refreshable {
                 await session.refreshDashboard()
@@ -636,7 +770,9 @@ struct DashboardView: View {
                     .foregroundStyle(.secondary)
                 
                 HStack(spacing: 10) {
-                    Button { } label: {
+                    Button {
+                        showStormSettings = true
+                    } label: {
                         Label("Storm Settings", systemImage: "slider.horizontal.3")
                     }
                     .buttonStyle(.bordered)
@@ -658,11 +794,20 @@ struct DashboardView: View {
                     .font(.headline)
                 
                 
-                if session.assignedProperties.isEmpty {
+                if session.activeStorm?.is_closed == true {
+                    
+                    Text("Storm ended. No active jobs.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    
+                } else if session.assignedProperties.isEmpty {
+                    
                     Text("None assigned yet.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
+                    
                 } else {
+                    
                     let activeProperties = Array(dashboardProperties.prefix(6))
                     
                     let finishedProperties = session.assignedProperties.filter { p in
@@ -848,6 +993,81 @@ struct DashboardView: View {
     }
 }
 
+struct StormSettingsSheet: View {
+    @EnvironmentObject var session: SupabaseSessionStore
+    @Environment(\.dismiss) private var dismiss
+    @State private var showEndConfirm = false
+    
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: 14) {
+                    
+                    Card {
+                        VStack(alignment: .leading, spacing: 10) {
+                            
+                            Text("Current Storm")
+                                .font(.headline)
+                            
+                            Text(session.activeStorm?.name ?? "No active storm")
+                                .font(.title2.weight(.semibold))
+                            
+                            Text("End storm keeps logs and reports, but clears live driver statuses.")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    
+                    Card {
+                        Button(role: .destructive) {
+                            showEndConfirm = true
+                        } label: {
+                            Label("End Storm / Close Out", systemImage: "xmark.octagon.fill")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        
+                        Button {
+                            Task {
+                                await session.reopenActiveStorm()
+                                dismiss()
+                            }
+                        } label: {
+                            Label("Reopen Storm", systemImage: "arrow.uturn.backward.circle")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+                .padding(16)
+            }
+            .navigationTitle("Storm Settings")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+            }
+            .alert("End this storm?", isPresented: $showEndConfirm) {
+                
+                Button("Cancel", role: .cancel) { }
+                
+                Button("End Storm", role: .destructive) {
+                    Task {
+                        await session.endActiveStorm()
+                        dismiss()
+                    }
+                }
+                
+            } message: {
+                Text("This will close the storm and clear live driver statuses.")
+            }
+        }
+    }
+}
+
 // MARK: - Log Placeholder
 
 struct LogView: View {
@@ -875,9 +1095,13 @@ struct LogView: View {
 
 struct ReportsView: View {
     @EnvironmentObject var store: AppStore
+    @EnvironmentObject var session: SupabaseSessionStore
     @State private var showShare = false
     @State private var exportURL: URL?
     @State private var showRates = false
+    
+    @State private var showPDFPreview = false
+    @State private var previewId = UUID()
     
     var body: some View {
         NavigationStack {
@@ -903,6 +1127,7 @@ struct ReportsView: View {
                                     }
                                     
                                     HStack {
+                                        metric("Open Up", t.openUpHours)
                                         metric("Plow", t.plowHours)
                                         metric("Salt", t.saltHours)
                                         metric("Standby", t.standbyHours)
@@ -925,8 +1150,10 @@ struct ReportsView: View {
                             Text("Export")
                                 .font(.headline)
                             
-                            Button { exportCSV() } label: {
-                                Label("Export Current Storm CSV", systemImage: "square.and.arrow.up")
+                            Button {
+                                exportPDF()
+                            } label: {
+                                Label("Export Current Storm PDF", systemImage: "doc.richtext")
                                     .frame(maxWidth: .infinity)
                             }
                             .buttonStyle(.borderedProminent)
@@ -939,7 +1166,101 @@ struct ReportsView: View {
             .sheet(isPresented: $showShare) {
                 if let url = exportURL { ActivityView(activityItems: [url]) }
             }
+            .sheet(isPresented: $showPDFPreview) {
+                if let url = exportURL {
+                    PDFPreview(url: url)
+                        .id(previewId)
+                } else {
+                    Text("No PDF found")
+                }
+            }
             .sheet(isPresented: $showRates) { RatesSheet() }
+        }
+    }
+    
+    private var supabaseInvoiceTotal: Double {
+        session.recentLogs.reduce(0) { total, log in
+            let hours = Double(log.seconds ?? 0) / 3600.0
+            let billable = hours > 0 ? max(hours, store.rates.minimumHoursPerLog) : 0
+            let service = (log.service ?? "").lowercased()
+            
+            if service == "open up" {
+                return total + billable * store.rates.openUpPerHour
+            } else if service == "plow" {
+                return total + billable * store.rates.plowPerHour
+            } else if service == "salt" {
+                return total + billable * store.rates.saltPerHour
+            } else if service == "standby" {
+                return total + billable * store.rates.standbyPerHour
+            } else {
+                return total
+            }
+        }
+    }
+    
+    private func exportPDF() {
+        
+        let renderer = UIGraphicsPDFRenderer(
+            bounds: CGRect(x: 0, y: 0, width: 612, height: 792)
+        )
+        
+        let data = renderer.pdfData { ctx in
+            
+            ctx.beginPage()
+            
+            let title = "Snow Storm Report"
+            let storm = session.activeStorm?.name ?? "Unknown Storm"
+            
+            let text = """
+        \(title)
+        
+        Storm:
+        \(storm)
+        
+        Total Logs:
+        \(session.recentLogs.count)
+        
+        Completed:
+        \(session.dashboardTotals.completed)
+        
+        Issues:
+        \(session.dashboardTotals.issues)
+        
+        Skipped:
+        \(session.dashboardTotals.skipped)
+        
+        Total Hours:
+        \(String(format: "%.1f", session.dashboardTotals.totalHours))
+        
+        Total Invoice:
+        \(currency(supabaseInvoiceTotal))
+        """
+            
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: UIFont.systemFont(ofSize: 20)
+            ]
+            
+            text.draw(
+                in: CGRect(x: 40, y: 40, width: 520, height: 700),
+                withAttributes: attrs
+            )
+        }
+        
+        let filename = "StormReport.pdf"
+        
+        let url = FileManager.default
+            .temporaryDirectory
+            .appendingPathComponent(filename)
+        
+        do {
+            try data.write(to: url)
+            
+            exportURL = url
+            previewId = UUID()
+            showPDFPreview = true
+            
+        } catch {
+            print("PDF export failed:", error)
         }
     }
     
@@ -1327,6 +1648,7 @@ struct LogJobSheet: View {
         
         store.activeStoppedAt = nil
         store.activeIsRunning = true
+        store.saveClockState()
         
         LocationManager.shared.start()
         
@@ -1359,6 +1681,7 @@ struct LogJobSheet: View {
         }
         
         store.activeIsRunning = false
+        store.saveClockState()
         
         LocationManager.shared.stop()
         
@@ -1375,11 +1698,14 @@ struct LogJobSheet: View {
     }
     
     private func resetTimer() {
-        
+        store.activePropertyId = nil
+        store.activePropertyName = ""
         store.activeSeconds = 0
         store.activeStartedAt = nil
         store.activeStoppedAt = nil
         store.activeIsRunning = false
+        store.activeService = .plow
+        store.clearClockState()
         
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
@@ -1489,6 +1815,7 @@ struct LogJobSheet: View {
             }
             
             // optional local log
+            let openUp = (service == .openUp) ? effectiveHours : 0
             let plow = (service == .plow) ? effectiveHours : 0
             let salt = (service == .salt) ? effectiveHours : 0
             let standby = (service == .standby) ? effectiveHours : 0
@@ -1498,6 +1825,7 @@ struct LogJobSheet: View {
                     date: .now,
                     driver: driverNameToSave,
                     mapNumber: p.map_number,
+                    openUpHours: openUp,
                     plowHours: plow,
                     saltHours: salt,
                     standbyHours: standby,
@@ -1523,6 +1851,7 @@ struct LogJobSheet: View {
             store.activeSeconds = 0
             store.activeIsRunning = false
             store.activeService = .plow
+            store.clearClockState()
             dismiss()
             
         } catch {
@@ -1632,6 +1961,53 @@ struct ActivityView: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
+import QuickLook
+
+struct PDFPreview: UIViewControllerRepresentable {
+    
+    let url: URL
+    
+    func makeUIViewController(context: Context) -> QLPreviewController {
+        
+        let controller = QLPreviewController()
+        controller.dataSource = context.coordinator
+        
+        return controller
+    }
+    
+    func updateUIViewController(
+        _ uiViewController: QLPreviewController,
+        context: Context
+    ) { }
+    
+    func makeCoordinator() -> Coordinator {
+        Coordinator(url: url)
+    }
+    
+    final class Coordinator: NSObject, QLPreviewControllerDataSource {
+        
+        let url: URL
+        
+        init(url: URL) {
+            self.url = url
+        }
+        
+        func numberOfPreviewItems(
+            in controller: QLPreviewController
+        ) -> Int {
+            1
+        }
+        
+        func previewController(
+            _ controller: QLPreviewController,
+            previewItemAt index: Int
+        ) -> QLPreviewItem {
+            
+            url as NSURL
+        }
+    }
+}
+
 // MARK: - Rates
 
 struct RatesSheet: View {
@@ -1646,6 +2022,7 @@ struct RatesSheet: View {
                         VStack(alignment: .leading, spacing: 12) {
                             Text("Hourly Rates").font(.headline)
                             rateField("Minimum per log (hours)", value: $store.rates.minimumHoursPerLog)
+                            rateField("Open Up / hr", value: $store.rates.openUpPerHour)
                             rateField("Plow / hr", value: $store.rates.plowPerHour)
                             rateField("Salt / hr", value: $store.rates.saltPerHour)
                             rateField("Standby / hr", value: $store.rates.standbyPerHour)

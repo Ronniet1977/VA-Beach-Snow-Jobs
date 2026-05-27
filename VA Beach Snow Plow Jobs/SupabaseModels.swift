@@ -38,6 +38,9 @@ struct PropertyRow: Decodable, Identifiable {
     let priority: String
     let latitude: Double?
     let longitude: Double?
+    
+    let gps_verified: Bool?
+    let gps_problem: Bool?
 }
 
 struct StormRow: Decodable, Identifiable {
