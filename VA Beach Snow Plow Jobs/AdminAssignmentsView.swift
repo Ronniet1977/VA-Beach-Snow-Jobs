@@ -40,7 +40,6 @@ struct AdminAssignmentsView: View {
     
     @State private var selectedGroupId: UUID?
     @State private var closestCountText = "5"
-    @State private var suggestedRouteIds: [UUID] = []
     
     var body: some View {
         NavigationStack {
@@ -210,7 +209,7 @@ struct AdminAssignmentsView: View {
                     Text("Drivers")
                         .font(.headline)
                     
-                    ForEach(drivers) { d in
+                    ForEach(namedDrivers) { d in
                         
                         Button {
                             toggleDriver(d.id)
@@ -325,7 +324,7 @@ struct AdminAssignmentsView: View {
             let seedProperty = filteredProperties.first {
                 selectedPropertyIds.contains($0.id)
             }
-            ForEach(orderedPropertiesForDisplay) { p in
+            ForEach(filteredProperties) { p in
                 Button {
                     toggle(p.id)
                 } label: {
@@ -384,15 +383,7 @@ struct AdminAssignmentsView: View {
                         set: { id in
                             selectedStormId = id
                             session.setActiveStorm(id)
-                            
-                            Task {
-                                if let id {
-                                    session.activeStorm = try? await session.fetchStormById(id)
-                                }
-                                
-                                await reloadAll()
-                                await session.refreshDashboard()
-                            }
+                            Task { await reloadAll() }
                         }
                     )) {
                         Text("Select…").tag(UUID?.none)
@@ -420,8 +411,8 @@ struct AdminAssignmentsView: View {
                     
                     Picker("Driver", selection: $selectedDriverId) {
                         Text("Select…").tag(UUID?.none)
-                        ForEach(drivers) { d in
-                            Text(d.name?.isEmpty == false ? d.name! : d.id.uuidString)
+                        ForEach(namedDrivers) { d in
+                            Text(d.name ?? "Driver")
                                 .tag(Optional(d.id))
                         }
                     }
@@ -444,35 +435,70 @@ struct AdminAssignmentsView: View {
                         .textFieldStyle(.roundedBorder)
                     
                     VStack(spacing: 10) {
-                        ForEach(groupAvailableProperties) { p in
-                            Button { toggle(p.id) } label: {
+                        ForEach(filteredProperties) { p in
+                            
+                            Button {
+                                toggle(p.id)
+                            } label: {
                                 HStack(spacing: 12) {
-                                    Image(systemName: selectedPropertyIds.contains(p.id) ? "checkmark.circle.fill" : "circle")
-                                        .foregroundStyle(.secondary)
                                     
-                                    VStack(alignment: .leading, spacing: 2) {
+                                    Image(
+                                        systemName: selectedPropertyIds.contains(p.id)
+                                        ? "checkmark.circle.fill"
+                                        : "circle"
+                                    )
+                                    .foregroundStyle(.secondary)
+                                    
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        
                                         Text("Map #\(p.map_number) • \(p.name)")
                                             .font(.subheadline.weight(.semibold))
+                                        
                                         Text(p.address)
                                             .font(.caption)
                                             .foregroundStyle(.secondary)
-                                    }
-                                    
-                                    if suggestedRouteIds.contains(p.id),
-                                       let miles = distanceFromPreviousStop(for: p) {
-                                        Text("\(miles, specifier: "%.1f") mi from previous stop")
-                                            .font(.caption2.weight(.semibold))
-                                            .foregroundStyle(.blue)
+                                        
+                                        let assignedRows = assignments.filter {
+                                            $0.property_id == p.id &&
+                                            $0.status != "declined"
+                                        }
+                                        
+                                        let currentStatus = assignedRows
+                                            .sorted {
+                                                assignmentRank($0.status) > assignmentRank($1.status)
+                                            }
+                                            .first?
+                                            .status
+                                        
+                                        let driverNames = assignedRows.compactMap { assignment in
+                                            drivers.first(where: {
+                                                $0.id == assignment.driver_id
+                                            })?.name
+                                        }
+                                        
+                                        if !assignedRows.isEmpty {
+                                            HStack(spacing: 6) {
+                                                Image(systemName: statusIcon(currentStatus))
+                                                    .font(.caption2)
+                                                
+                                                Text(
+                                                    driverNames.count == 1
+                                                    ? "\(statusText(currentStatus)) • \(driverNames.first ?? "Driver")"
+                                                    : "\(statusText(currentStatus)) • \(driverNames.count) Drivers"
+                                                )
+                                                .font(.caption2.bold())
+                                            }
+                                            .foregroundStyle(statusColor(currentStatus))
+                                        }
                                     }
                                     
                                     Spacer()
                                     
-                                    if let name = assignedLabel(for: p.id) {
-                                        StatusPill(systemImage: "person.fill", text: "Assigned: \(name)")
-                                    }
-                                    
                                     if p.priority == "high" {
-                                        StatusPill(systemImage: "star.fill", text: "High")
+                                        StatusPill(
+                                            systemImage: "star.fill",
+                                            text: "High"
+                                        )
                                     }
                                 }
                             }
@@ -523,8 +549,8 @@ struct AdminAssignmentsView: View {
                     
                     Picker("Driver", selection: $driverTabSelectedDriverId) {
                         Text("Select…").tag(UUID?.none)
-                        ForEach(drivers) { d in
-                            Text(d.name?.isEmpty == false ? d.name! : d.id.uuidString)
+                        ForEach(namedDrivers) { d in
+                            Text(d.name ?? "Driver")
                                 .tag(Optional(d.id))
                         }
                     }
@@ -617,36 +643,6 @@ struct AdminAssignmentsView: View {
         }
     }
     
-    private var orderedPropertiesForDisplay: [PropertyRow] {
-        
-        let selectedRoute = suggestedRouteIds.compactMap { id in
-            filteredProperties.first { $0.id == id }
-        }
-        
-        let remaining = filteredProperties.filter {
-            !suggestedRouteIds.contains($0.id)
-        }
-        
-        return selectedRoute + remaining.sorted {
-            $0.map_number < $1.map_number
-        }
-    }
-    
-    private func distanceFromPreviousStop(for property: PropertyRow) -> Double? {
-        guard let index = suggestedRouteIds.firstIndex(of: property.id),
-              index > 0 else {
-            return nil
-        }
-        
-        let previousId = suggestedRouteIds[index - 1]
-        
-        guard let previous = properties.first(where: { $0.id == previousId }) else {
-            return nil
-        }
-        
-        return propertyDistanceMiles(from: previous, to: property)
-    }
-    
     private func assignGroupTapped() async {
         guard let stormId = selectedStormId else { return }
         
@@ -699,6 +695,14 @@ struct AdminAssignmentsView: View {
         }
     }
     
+    private var namedDrivers: [DriverRow] {
+        drivers.filter {
+            !($0.name ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .isEmpty
+        }
+    }
+    
     private var canAssignGroup: Bool {
         selectedStormId != nil &&
         !selectedDriverIds.isEmpty &&
@@ -729,36 +733,30 @@ struct AdminAssignmentsView: View {
     
     private func selectClosestPropertiesForGroup() {
         let count = Int(closestCountText) ?? 5
+        
         let candidates = groupAvailableProperties
         
         guard !candidates.isEmpty else { return }
         
+        // Use first manually selected property as the "seed"
         guard let seedId = selectedPropertyIds.first,
-              let seed = candidates.first(where: { $0.id == seedId }) else {
-            errorText = "Tap one starting property first."
+              let seed = candidates.first(where: { $0.id == seedId }),
+              let seedLat = seed.latitude,
+              let seedLon = seed.longitude else {
+            print("Select one starting property first.")
             return
         }
         
-        var remaining = candidates.filter { $0.id != seed.id }
-        var route: [PropertyRow] = [seed]
+        let seedLocation = CLLocation(latitude: seedLat, longitude: seedLon)
         
-        while route.count < count && !remaining.isEmpty {
-            guard let last = route.last else { break }
-            
-            guard let next = remaining.min(by: {
-                (propertyDistanceMiles(from: last, to: $0) ?? .greatestFiniteMagnitude)
-                <
-                    (propertyDistanceMiles(from: last, to: $1) ?? .greatestFiniteMagnitude)
-            }) else {
-                break
+        let closest = candidates
+            .sorted {
+                distance(from: seedLocation, to: $0) <
+                    distance(from: seedLocation, to: $1)
             }
-            
-            route.append(next)
-            remaining.removeAll { $0.id == next.id }
-        }
+            .prefix(count)
         
-        suggestedRouteIds = route.map { $0.id }
-        selectedPropertyIds = Set(suggestedRouteIds)
+        selectedPropertyIds = Set(closest.map { $0.id })
     }
     
     private func distance(
@@ -783,7 +781,7 @@ struct AdminAssignmentsView: View {
                 return false
             }
             
-            let alreadyAssigned = session.assignments.contains {
+            let alreadyAssigned = assignments.contains {
                 $0.property_id == p.id &&
                 $0.status != "finished" &&
                 $0.status != "declined"
@@ -845,6 +843,75 @@ struct AdminAssignmentsView: View {
         }
     }
     
+    private func statusColor(_ status: String?) -> Color {
+        switch (status ?? "").lowercased() {
+        case "pending", "accepted":
+            return .gray
+        case "opened_up":
+            return .blue
+        case "plowed":
+            return .orange
+        case "salted":
+            return .purple
+        case "finished":
+            return .green
+        case "issue":
+            return .red
+        default:
+            return .gray
+        }
+    }
+    
+    private func assignmentRank(_ status: String?) -> Int {
+        switch (status ?? "").lowercased() {
+        case "finished": return 5
+        case "salted": return 4
+        case "plowed": return 3
+        case "opened_up": return 2
+        case "accepted": return 1
+        case "pending": return 0
+        default: return -1
+        }
+    }
+    
+    private func statusText(_ status: String?) -> String {
+        switch (status ?? "").lowercased() {
+        case "pending":
+            return "Pending"
+        case "accepted":
+            return "Assigned"
+        case "opened_up":
+            return "Opened Up"
+        case "plowed":
+            return "Plowed"
+        case "salted":
+            return "Salted"
+        case "finished":
+            return "Finished"
+        case "issue":
+            return "Issue"
+        default:
+            return "Assigned"
+        }
+    }
+    
+    private func statusIcon(_ status: String?) -> String {
+        switch (status ?? "").lowercased() {
+        case "opened_up":
+            return "road.lanes"
+        case "plowed":
+            return "snowflake"
+        case "salted":
+            return "drop.fill"
+        case "finished":
+            return "checkmark.circle.fill"
+        case "issue":
+            return "exclamationmark.triangle.fill"
+        default:
+            return "clock"
+        }
+    }
+    
     private func toggle(_ id: UUID) {
         if selectedPropertyIds.contains(id) {
             selectedPropertyIds.remove(id)
@@ -859,7 +926,7 @@ struct AdminAssignmentsView: View {
         defer { isLoading = false }
         
         do {
-            async let s = session.fetchStorms()
+            async let s = session.fetchOpenStorms()
             async let d = session.fetchDrivers()
             async let p = session.fetchAllProperties()
             

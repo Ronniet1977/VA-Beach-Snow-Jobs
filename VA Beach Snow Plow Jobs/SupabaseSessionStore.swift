@@ -89,43 +89,6 @@ final class SupabaseSessionStore: ObservableObject {
         }
     }
     
-    func updatePropertyGPSStatus(
-        propertyId: UUID,
-        verified: Bool,
-        problem: Bool
-    ) async throws {
-        
-        var c = URLComponents(
-            string: "\(SupabaseConfig.url)/rest/v1/properties"
-        )!
-        
-        c.query = "id=eq.\(propertyId.uuidString)"
-        
-        var req = try authedRequest(url: c.url!, method: "PATCH")
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("return=minimal", forHTTPHeaderField: "Prefer")
-        
-        let body: [String: Bool] = [
-            "gps_verified": verified,
-            "gps_problem": problem
-        ]
-        
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        
-        let (data, http) = try await dataWithAutoRefresh(for: req)
-        
-        guard (200...299).contains(http.statusCode) else {
-            throw NSError(
-                domain: "updatePropertyGPSStatus",
-                code: http.statusCode,
-                userInfo: [
-                    NSLocalizedDescriptionKey:
-                        String(data: data, encoding: .utf8) ?? "GPS status update failed"
-                ]
-            )
-        }
-    }
-    
     func updatePropertyCoordinates(
         propertyId: UUID,
         latitude: Double,
@@ -242,53 +205,6 @@ final class SupabaseSessionStore: ObservableObject {
         }
     }
     
-    @MainActor
-    func reopenActiveStorm() async {
-        guard let stormId = activeStorm?.id ?? activeStormId else {
-            lastError = "No storm selected to reopen."
-            return
-        }
-        
-        do {
-            var c = URLComponents(
-                string: "\(SupabaseConfig.url)/rest/v1/storms"
-            )!
-            
-            c.query = "id=eq.\(stormId.uuidString)"
-            
-            var req = try authedRequest(
-                url: c.url!,
-                method: "PATCH"
-            )
-            
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.setValue("return=minimal", forHTTPHeaderField: "Prefer")
-            
-            let body: [String: Any] = [
-                "is_closed": false
-            ]
-            
-            req.httpBody = try JSONSerialization.data(
-                withJSONObject: body
-            )
-            
-            let (data, http) = try await dataWithAutoRefresh(for: req)
-            
-            guard (200...299).contains(http.statusCode) else {
-                lastError = String(data: data, encoding: .utf8) ?? "Reopen storm failed"
-                return
-            }
-            
-            setActiveStorm(stormId)
-            activeStorm = try await fetchStormById(stormId)
-            
-            await refreshDashboard()
-            await refreshAssignedProperties()
-            
-        } catch {
-            lastError = error.localizedDescription
-        }
-    }
     
     func fetchDriverStatuses() async throws -> [DriverStatusRow] {
         
@@ -627,6 +543,25 @@ final class SupabaseSessionStore: ObservableObject {
         }
     }
     
+    func sendDriverHeartbeat(
+        status: String,
+        activePropertyId: UUID?,
+        activeService: String?,
+        startedAt: Date?
+    ) async {
+        
+        let location = LocationManager.shared.lastLocation
+        
+        await updateMyDriverStatus(
+            status: status,
+            activePropertyId: activePropertyId,
+            activeService: activeService,
+            startedAt: startedAt,
+            lat: location?.coordinate.latitude,
+            lon: location?.coordinate.longitude
+        )
+    }
+    
     private func handleAuthFailure(_ http: HTTPURLResponse, bodyData: Data) {
         // NOTE:
         // We *don't* immediately sign out on JWT expired anymore.
@@ -735,7 +670,7 @@ final class SupabaseSessionStore: ObservableObject {
     func fetchAllProperties() async throws -> [PropertyRow] {
         // Admin can read all properties (RLS allows admin)
         var c = URLComponents(string: "\(SupabaseConfig.url)/rest/v1/properties")!
-        c.query = "select=id,map_number,name,address,notes,active,priority,latitude,longitude,gps_verified,gps_problem&order=map_number.asc"
+        c.query = "select=id,map_number,name,address,notes,active,priority,latitude,longitude&order=map_number.asc"
         var req = try authedRequest(url: c.url!, method: "GET")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         req.cachePolicy = .reloadIgnoringLocalCacheData
@@ -788,9 +723,9 @@ final class SupabaseSessionStore: ObservableObject {
         return rows.compactMap { $0.property }
     }
     
-    func fetchStorms() async throws -> [StormRow] {
+    func fetchOpenStorms() async throws -> [StormRow] {
         var c = URLComponents(string: "\(SupabaseConfig.url)/rest/v1/storms")!
-        c.query = "select=id,name,is_closed,created_at,end_at&order=created_at.desc"
+        c.query = "select=id,name,is_closed&is_closed=eq.false&order=created_at.desc"
         var req = try authedRequest(url: c.url!, method: "GET")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         req.cachePolicy = .reloadIgnoringLocalCacheData
@@ -820,6 +755,10 @@ final class SupabaseSessionStore: ObservableObject {
         
         let rows = try JSONDecoder().decode([StormRow].self, from: data)
         let storm = rows.first
+        
+        if let id = storm?.id {
+            setActiveStorm(id)   // 🔥 auto-sync
+        }
         
         return storm
     }
@@ -863,18 +802,14 @@ final class SupabaseSessionStore: ObservableObject {
         do {
             // 1) Decide which storm is active
             if let stormId = self.activeStormId,
-               let storm = try await fetchStormById(stormId) {
+               let storm = try await fetchStormById(stormId),
+               (storm.is_closed == false || storm.is_closed == nil) {
                 
                 self.activeStorm = storm
                 self.activeStormId = storm.id
                 
-            } else if self.activeStorm == nil {
-                
+            } else {
                 self.activeStorm = try await fetchActiveStorm()
-                
-                if let id = self.activeStorm?.id {
-                    self.setActiveStorm(id)
-                }
             }
             
             // ✅ STEP 4 GOES RIGHT HERE (after activeStorm is chosen)
@@ -888,17 +823,6 @@ final class SupabaseSessionStore: ObservableObject {
                 self.dashboardTotals = .init()
                 return
             }
-            
-            if self.activeStorm?.is_closed == true {
-                
-                self.assignedProperties = []
-                self.assignments = []
-                self.recentLogs = []
-                self.dashboardTotals = DashboardTotals()
-                
-                return
-            }
-            
             self.assignedProperties = try await fetchAssignedProperties(stormId: stormId)
             self.assignments = try await fetchAssignments(stormId: stormId)
             
@@ -932,68 +856,6 @@ final class SupabaseSessionStore: ObservableObject {
                 if let sec = l.seconds { t.totalHours += Double(sec) / 3600.0 }
             }
             self.dashboardTotals = t
-            
-        } catch {
-            lastError = error.localizedDescription
-        }
-    }
-    
-    @MainActor
-    func endActiveStorm() async {
-        guard let stormId = activeStorm?.id ?? activeStormId else {
-            lastError = "No active storm to end."
-            return
-        }
-        
-        do {
-            // 1. Close the storm
-            var stormURL = URLComponents(
-                string: "\(SupabaseConfig.url)/rest/v1/storms"
-            )!
-            stormURL.query = "id=eq.\(stormId.uuidString)"
-            
-            var stormReq = try authedRequest(url: stormURL.url!, method: "PATCH")
-            stormReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            stormReq.setValue("return=minimal", forHTTPHeaderField: "Prefer")
-            
-            stormReq.httpBody = try JSONSerialization.data(
-                withJSONObject: [
-                    "is_closed": true,
-                    "end_at": ISO8601DateFormatter().string(from: Date())
-                ]
-            )
-            
-            let (_, stormHTTP) = try await dataWithAutoRefresh(for: stormReq)
-            guard (200...299).contains(stormHTTP.statusCode) else { return }
-            
-            // 2. Clear live driver statuses for this storm
-            var statusURL = URLComponents(
-                string: "\(SupabaseConfig.url)/rest/v1/driver_status"
-            )!
-            statusURL.query = "storm_id=eq.\(stormId.uuidString)"
-            
-            var statusReq = try authedRequest(url: statusURL.url!, method: "PATCH")
-            statusReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            statusReq.setValue("return=minimal", forHTTPHeaderField: "Prefer")
-            
-            let statusBody: [String: Any] = [
-                "status": "idle",
-                "active_service": "",
-                "notes": ""
-            ]
-            
-            statusReq.httpBody = try JSONSerialization.data(
-                withJSONObject: statusBody
-            )
-            
-            _ = try await dataWithAutoRefresh(for: statusReq)
-            
-            activeStorm = try? await fetchStormById(stormId)
-            setActiveStorm(stormId)
-            
-            assignedProperties = []
-            assignments = []
-            driverStatuses = []
             
         } catch {
             lastError = error.localizedDescription
@@ -1406,8 +1268,6 @@ final class SupabaseSessionStore: ObservableObject {
             let assignments: [AssignmentMini]
             let latitude: Double?
             let longitude: Double?
-            let gps_verified: Bool?
-            let gps_problem: Bool?
             
             struct AssignmentMini: Decodable {
                 let storm_id: UUID
@@ -1424,9 +1284,7 @@ final class SupabaseSessionStore: ObservableObject {
                     active: active,
                     priority: priority,
                     latitude: latitude,
-                    longitude: longitude,
-                    gps_verified: gps_verified,
-                    gps_problem: gps_problem
+                    longitude: longitude
                 )
             }
         }

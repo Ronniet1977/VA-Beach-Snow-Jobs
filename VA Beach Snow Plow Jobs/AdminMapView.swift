@@ -30,10 +30,10 @@ struct AdminMapView: View {
                             coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon)
                         ) {
                             VStack(spacing: 4) {
-                                Image(systemName: icon(for: row))
+                                Image(systemName: icon(for: row.status))
                                     .font(.headline)
                                     .padding(8)
-                                    .background(color(for: row))
+                                    .background(color(for: row.status))
                                     .foregroundStyle(.white)
                                     .clipShape(Circle())
                                 
@@ -111,13 +111,6 @@ struct AdminMapView: View {
         return .green
     }
     
-    private func isStale(_ row: DriverStatusRow) -> Bool {
-        guard let iso = row.last_seen else { return true }
-        let f = ISO8601DateFormatter()
-        guard let date = f.date(from: iso) else { return true }
-        return Date().timeIntervalSince(date) > 15 * 60
-    }
-    
     private func centerOnFirstDriver() {
         guard let first = driversWithLocation.first,
               let lat = first.current_lat,
@@ -131,81 +124,24 @@ struct AdminMapView: View {
         )
     }
     
-    private func icon(for row: DriverStatusRow) -> String {
-        
-        let status = (row.status ?? "").lowercased()
-        
-        if status == "working" {
-            return "snowplow.fill"
+    private func icon(for status: String?) -> String {
+        switch status {
+        case "working": return "snowflake"
+        case "issue": return "exclamationmark.triangle.fill"
+        case "stopped": return "pause.fill"
+        case "idle": return "circle.fill"
+        default: return "questionmark"
         }
-        
-        if status == "issue" {
-            return "exclamationmark.triangle.fill"
-        }
-        
-        if status == "stopped" {
-            return "pause.circle.fill"
-        }
-        
-        if status == "idle" {
-            return "moon.zzz.fill"
-        }
-        
-        // stale GPS check
-        if let lastSeen = row.last_seen {
-            let iso = ISO8601DateFormatter()
-            
-            if let date = iso.date(from: lastSeen) {
-                
-                let minutes =
-                Date().timeIntervalSince(date) / 60
-                
-                if minutes > 15 {
-                    return "wifi.slash"
-                }
-            }
-        }
-        
-        return "car.fill"
     }
     
-    private func color(for row: DriverStatusRow) -> Color {
-        
-        let status = (row.status ?? "").lowercased()
-        
-        if status == "working" {
-            return .green
+    private func color(for status: String?) -> Color {
+        switch status {
+        case "working": return .green
+        case "issue": return .red
+        case "stopped": return .orange
+        case "idle": return .gray
+        default: return .gray
         }
-        
-        if status == "issue" {
-            return .red
-        }
-        
-        if status == "stopped" {
-            return .orange
-        }
-        
-        if status == "idle" {
-            return .gray
-        }
-        
-        // stale GPS
-        if let lastSeen = row.last_seen {
-            
-            let iso = ISO8601DateFormatter()
-            
-            if let date = iso.date(from: lastSeen) {
-                
-                let minutes =
-                Date().timeIntervalSince(date) / 60
-                
-                if minutes > 15 {
-                    return .black
-                }
-            }
-        }
-        
-        return .blue
     }
 }
 
@@ -235,6 +171,7 @@ struct PropertyMapPin: View {
 
 struct PropertyDetailSheet: View {
     @EnvironmentObject var session: SupabaseSessionStore
+    @State private var drivers: [DriverRow] = []
     let property: PropertyRow
     
     var body: some View {
@@ -253,8 +190,6 @@ struct PropertyDetailSheet: View {
                             Text(property.address)
                                 .foregroundStyle(.secondary)
                             
-                            
-                            
                             if property.latitude == nil || property.longitude == nil {
                                 
                                 StatusPill(
@@ -266,19 +201,49 @@ struct PropertyDetailSheet: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     
-                    if let assigned = session.driverStatuses.first(where: {
-                        $0.properties?.map_number == property.map_number
-                    }) {
+                    if !propertyAssignments.isEmpty {
                         Card {
-                            VStack(alignment: .leading, spacing: 10) {
-                                Text("Assigned Driver")
-                                    .font(.headline)
+                            VStack(alignment: .leading, spacing: 12) {
                                 
-                                Text(assigned.profiles?.name ?? "Unknown")
-                                    .font(.title3.weight(.semibold))
+                                Text(
+                                    propertyAssignments.count == 1
+                                    ? "Assigned Driver"
+                                    : "Assigned Drivers"
+                                )
+                                .font(.headline)
                                 
-                                Text("Status: \(assigned.status ?? "Unknown")")
-                                    .foregroundStyle(.secondary)
+                                ForEach(propertyAssignments) { assignment in
+                                    
+                                    let driverName =
+                                    drivers.first(where: {
+                                        $0.id == assignment.driver_id
+                                    })?.name ?? "Unknown Driver"
+                                    
+                                    HStack(spacing: 10) {
+                                        
+                                        Circle()
+                                            .fill(statusColor(assignment.status))
+                                            .frame(width: 10, height: 10)
+                                        
+                                        VStack(alignment: .leading, spacing: 3) {
+                                            
+                                            Text(driverName)
+                                                .font(.title3.weight(.semibold))
+                                            
+                                            Text(statusText(assignment.status))
+                                                .font(.caption.weight(.semibold))
+                                                .foregroundStyle(
+                                                    statusColor(assignment.status)
+                                                )
+                                        }
+                                        
+                                        Spacer()
+                                    }
+                                    
+                                    if assignment.id != propertyAssignments.last?.id {
+                                        Divider()
+                                    }
+                                }
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
                         }
@@ -332,6 +297,62 @@ struct PropertyDetailSheet: View {
                 .padding(16)
             }
             .navigationTitle("Property")
+            .task {
+                do {
+                    drivers = try await session.fetchDrivers()
+                } catch {
+                    session.lastError = error.localizedDescription
+                }
+            }
+        }
+    }
+    
+    private var propertyAssignments: [AssignmentRow] {
+        session.assignments
+            .filter {
+                $0.property_id == property.id &&
+                $0.status?.lowercased() != "declined"
+            }
+            .sorted {
+                assignmentRank($0.status) >
+                assignmentRank($1.status)
+            }
+    }
+    
+    private func statusText(_ status: String?) -> String {
+        switch (status ?? "").lowercased() {
+        case "pending": return "Pending"
+        case "accepted": return "Assigned"
+        case "opened_up": return "Opened Up"
+        case "plowed": return "Plowed"
+        case "salted": return "Salted"
+        case "finished": return "Finished"
+        case "issue": return "Issue"
+        default: return "Assigned"
+        }
+    }
+    
+    private func statusColor(_ status: String?) -> Color {
+        switch (status ?? "").lowercased() {
+        case "pending", "accepted": return .gray
+        case "opened_up": return .blue
+        case "plowed": return .orange
+        case "salted": return .purple
+        case "finished": return .green
+        case "issue": return .red
+        default: return .gray
+        }
+    }
+    
+    private func assignmentRank(_ status: String?) -> Int {
+        switch (status ?? "").lowercased() {
+        case "finished": return 5
+        case "salted": return 4
+        case "plowed": return 3
+        case "opened_up": return 2
+        case "accepted": return 1
+        case "pending": return 0
+        default: return -1
         }
     }
     
@@ -356,8 +377,7 @@ struct PropertyDetailSheet: View {
     }
     
     private func openInMaps() {
-        let query = property.address
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let query = "\(property.name), \(property.address)"
         let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
         
         if let url = URL(string: "http://maps.apple.com/?q=\(encoded)") {
